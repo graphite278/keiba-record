@@ -1,0 +1,4 @@
+# metaには時点依存capと凍結閾値が入るため公開しない
+*_meta.json
+__pycache__/
+.DS_Store
