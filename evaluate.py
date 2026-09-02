@@ -24,6 +24,22 @@ predictions_*.csv(生成時に保存した全馬分)と確定成績を突き合�
   腕ごとの成績も出す。ただし1週あたり数点しかないので、
   数字を読むのは点数が数千に達してからである。
 
+2026/9/2 改訂:
+  - --fetch の出力先を週フォルダへ変更(<YYYY>-W<WW>/results_final.csv、冪等な上書き)。
+    従来はcwdへ results_YYYYMMDD.csv を書いていたため置き場所がずれ、
+    取得窓が週を跨いで重複も生じていた。旧形式の results_*.csv も
+    引き続き読み込むので、コミット済みの過去ファイルはそのままで良い
+  - 馬名の詰め物(全角スペース)を両側で除去してから結合する。
+    JV-Data由来の馬名は固定長詰めで、取得時期により有無が混在していた。
+    9/2時点では同形式同士の偶然一致で通っていたが、resultsの再生成や
+    古いファイルの削除で静かに外れるため恒久化する
+
+2026/8/31 改訂:
+  - invalid/ 検疫フォルダの除外を results 側にも適用し、パス要素で判定する
+  - 予想ファイルごとに結合キーを選ぶ。race_code 列の無い旧形式は
+    (race_date, bamei) で結合する(KeyError('race_code') の修正)
+  - race_code は両側で文字列に揃える(int64/str 混在で結合が外れないように)
+
 使い方:
   python evaluate.py
   python evaluate.py --fetch                 # DBから結果を取得してから照合
@@ -56,15 +72,36 @@ ap.add_argument("--pghost", default=os.environ.get("PGHOST", "192.168.10.2"))
 args = ap.parse_args()
 
 
+def write_weekly_results(df):
+    """確定成績をレース日のISO週ごとに <YYYY>-W<WW>/results_final.csv へ書く。
+
+    以前は results_YYYYMMDD.csv をカレントディレクトリへ1本書いていたため、
+    (a) 実行時のcwd次第で置き場所がずれる
+    (b) 取得窓(--days)が週を跨ぐので、週フォルダ単位の記録と噛み合わない
+    (c) 同じレースが複数ファイルに重複して残る
+    という問題があった。predictions と同じ週フォルダに、固定名で冪等に
+    上書きする方式へ変更。再取得しても同じ場所が更新されるだけでgitが汚れない"""
+    wk = pd.to_datetime(df.race_date).dt.isocalendar()
+    written = []
+    for (y, w), g in df.groupby([wk.year, wk.week]):
+        d = f"{int(y)}-W{int(w):02d}"
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "results_final.csv")
+        g.sort_values(["race_code", "umaban"]).to_csv(path, index=False)
+        written.append(f"  {path}: {len(g)} 頭")
+    print("週別に書き出し:")
+    print("\n".join(written))
+
+
 def fetch_results(days, host):
-    """確定成績をDBから results_YYYYMMDD.csv へ書き出す。
+    """確定成績をDBから取得し、週フォルダへ振り分ける。
 
     data_kubun='7' が確定成績。kakutei_chakujun や tansho_odds は
     text型で '00'/'0000' が未確定を意味するため、数値化の前に弾く。
     """
     end = date.today()
     start = end - timedelta(days=days)
-    out = f"results_{end:%Y%m%d}.csv"
+    tmp = "results_fetch_tmp.csv"
     sql = (
         "\\copy (SELECT (kaisai_nen||kaisai_gappi)::date AS race_date,"
         " race_code, umaban::int AS umaban, bamei,"
@@ -76,28 +113,58 @@ def fetch_results(days, host):
         " FROM umagoto_race_joho"
         " WHERE data_kubun='7' AND keibajo_code BETWEEN '01' AND '10'"
         f" AND (kaisai_nen||kaisai_gappi) BETWEEN '{start:%Y%m%d}'"
-        f" AND '{end:%Y%m%d}') TO '{out}' CSV HEADER")
+        f" AND '{end:%Y%m%d}') TO '{tmp}' CSV HEADER")
     cmd = ["psql", "-h", host, "-U", "postgres", "-d", "postgres",
            "-c", sql]
-    print(f"確定成績を取得中 ({start:%Y-%m-%d} 〜 {end:%Y-%m-%d}) → {out}")
+    print(f"確定成績を取得中 ({start:%Y-%m-%d} 〜 {end:%Y-%m-%d})")
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"取得に失敗しました:\n{r.stderr.strip()}")
-    print(f"  {r.stdout.strip()}")
+    df = pd.read_csv(tmp)
+    os.remove(tmp)
+    if df.empty:
+        sys.exit("取得0件。data_kubun='7' がまだ入っていない可能性")
+    write_weekly_results(df)
 
 
 if args.fetch:
     fetch_results(args.days, args.pghost)
 
-# 週ごとのサブフォルダに分かれているので再帰的に探す
-pred_files = sorted(glob.glob(args.pred, recursive=True))
-res_files = sorted(glob.glob(args.results, recursive=True))
+def quarantined(path):
+    """invalid/ 検疫フォルダ配下か。パス要素で判定する(部分一致だと
+    'invalidated_...' のような無関係な名前まで巻き込む)"""
+    parts = os.path.normpath(path).split(os.sep)
+    return "invalid" in parts
+
+
+def find_files(pattern, label):
+    """週ごとのサブフォルダに分かれているので再帰的に探し、検疫分を除く"""
+    found = sorted(glob.glob(pattern, recursive=True))
+    keep = [f for f in found if not quarantined(f)]
+    n_q = len(found) - len(keep)
+    print(f"{label} {len(keep)} 件" + (f" (検疫 {n_q} 件を除外)" if n_q else ""))
+    return keep
+
+
+pred_files = find_files(args.pred, "予想ファイル")
+res_files = find_files(args.results, "結果ファイル")
 if not pred_files or not res_files:
     sys.exit("predictions_*.csv または results_*.csv が見つかりません")
-print(f"予想ファイル {len(pred_files)} 件 / 結果ファイル {len(res_files)} 件")
+
+def norm_bamei(s):
+    """馬名の詰め物を剥がす。JV-Dataの馬名は固定長で全角スペース詰めのため、
+    取得時期・経路によって「コイバナ」と「コイバナ　　」が混在する。
+    (race_date, bamei) キーはこの差で静かに外れるので、両側を同じ規則に通す"""
+    return (s.astype(str)
+             .str.replace("\u3000", "", regex=False)   # 全角スペース
+             .str.replace(" ", "", regex=False)
+             .str.strip())
+
 
 res = pd.concat([pd.read_csv(f) for f in res_files], ignore_index=True)
 res["race_date"] = pd.to_datetime(res.race_date).dt.date
+if "bamei" in res.columns:
+    res["bamei"] = norm_bamei(res.bamei)
 res["chaku"] = pd.to_numeric(res.chaku, errors="coerce")
 res["odds_fin"] = pd.to_numeric(res.odds_fin, errors="coerce")
 # 結合キー: race_code+umaban があればそれを使う。
@@ -107,8 +174,11 @@ KEY = (["race_code", "umaban"]
        else ["race_date", "bamei"])
 if "umaban" in res.columns:
     res["umaban"] = pd.to_numeric(res.umaban, errors="coerce")
+if "race_code" in res.columns:
+    res["race_code"] = res.race_code.astype(str).str.strip()
 res = res.drop_duplicates(KEY)
-print(f"結合キー: {KEY}")
+FALLBACK_KEY = ["race_date", "bamei"]
+print(f"結合キー: {KEY} (race_code の無い古い予想ファイルは {FALLBACK_KEY})")
 
 # 各予想ファイルごとに上位x%を選び、それを積み上げる(実運用と同じ手順)
 sel_all = {f: [] for f in FRACS}
@@ -117,11 +187,23 @@ for pf in pred_files:
     p = pd.read_csv(pf)
     p["race_date"] = pd.to_datetime(p.race_date).dt.date
     p["batch"] = pf
+    if "bamei" in p.columns:
+        p["bamei"] = norm_bamei(p.bamei)
     if "umaban" in p.columns:
         p["umaban"] = pd.to_numeric(p.umaban, errors="coerce")
-    m = p.merge(res[KEY + ["chaku", "odds_fin"]], on=KEY, how="left")
+    if "race_code" in p.columns:
+        p["race_code"] = p.race_code.astype(str).str.strip()
+    # KeyError('race_code') の原因はここ。結合キーを結果側の列だけで決めていたため、
+    # race_code 列を持たない古い週の予想ファイルで merge が落ちていた
+    key = KEY if set(KEY) <= set(p.columns) else FALLBACK_KEY
+    if not set(key) <= set(p.columns):
+        print(f"  {pf}: 結合キー {key} の列が無いためスキップ")
+        continue
+    m = p.merge(res[key + ["chaku", "odds_fin"]].drop_duplicates(key),
+                on=key, how="left")
     miss = m.chaku.isna().sum()
-    print(f"  {pf}: {len(m)} 頭 / 結果と結合できず {miss} 頭")
+    print(f"  {pf}: {len(m)} 頭 / 結果と結合できず {miss} 頭"
+          + (f"  [旧形式: {key} で結合]" if key != KEY else ""))
     allp.append(m)
     for fr in FRACS:
         n = max(int(len(m) * fr), 1)
@@ -193,7 +275,8 @@ if have:
 print("\n=== 買い目の明細(上位2%) ===")
 cols = [c for c in ["race_date", "場", "race_bango", "umaban", "bamei",
                     "odds", "odds_fin", "chaku", "ev"] if c in d2.columns]
-print(d2.sort_values(["race_date", "race_bango"])[cols].to_string(index=False))
+sort_cols = [c for c in ["race_date", "race_bango"] if c in d2.columns]
+print(d2.sort_values(sort_cols)[cols].to_string(index=False))
 
 # 生成時オッズと確定オッズのずれ(締切間際の変動を実地で確認する)
 if "odds" in d2.columns:
