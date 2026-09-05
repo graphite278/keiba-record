@@ -2,3 +2,5 @@
 *_meta.json
 __pycache__/
 .DS_Store
+CLAUDE.md
+secrets.env
