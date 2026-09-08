@@ -44,7 +44,7 @@ predictions_*.csv(生成時に保存した全馬分)と確定成績を突き合�
   python evaluate.py
   python evaluate.py --fetch                 # DBから結果を取得してから照合
   python evaluate.py --fetch --days 7        # 直近7日分を取得
-  python evaluate.py --out results_summary.csv
+  python evaluate.py --out summary_20260908.csv   # results_*.csv と衝突する名前にしない
 """
 
 import argparse
@@ -63,7 +63,12 @@ PAYOUT = 0.79
 ap = argparse.ArgumentParser()
 ap.add_argument("--pred", default="**/predictions_*.csv")
 ap.add_argument("--results", default="**/results_*.csv")
-ap.add_argument("--out", default=None)
+ap.add_argument("--out", nargs="?", const=f"summary_{date.today():%Y%m%d}.csv",
+                default=None,
+                help="集計の書き出し先。--out だけ渡すと summary_<YYYYMMDD>.csv。"
+                     " results_*.csv に一致する名前にはしないこと。"
+                     " --results の既定パターンと衝突し、評価の出力が次回の"
+                     " 入力へ還流する(2026/9/8にW36の結合が全滅した原因)")
 ap.add_argument("--fetch", action="store_true",
                 help="DBから確定成績を書き出してから照合する")
 ap.add_argument("--days", type=int, default=14,
@@ -137,17 +142,41 @@ def quarantined(path):
     return "invalid" in parts
 
 
-def find_files(pattern, label):
-    """週ごとのサブフォルダに分かれているので再帰的に探し、検疫分を除く"""
+def derived(path):
+    """evaluate 自身の出力(派生物)か。
+
+    results_summary_*.csv は評価の出力であって結果の原本ではない。
+    しかし --results の既定パターン results_*.csv にマッチするため、
+    次回の evaluate の入力へ還流していた。評価の出力が評価の入力に
+    混ざる構造そのものが誤り(2026/9/8)。症状としては、これらが
+    race_code 列を持たないせいで連結時に float64 へ昇格し、
+    新形式の (race_code, umaban) 結合が静かに全滅した。
+    今後の出力は summary_*.csv に改名したので、これは過去分の縁切り。"""
+    return os.path.basename(path).startswith("results_summary")
+
+
+def find_files(pattern, label, drop_derived=False):
+    """週ごとのサブフォルダに分かれているので再帰的に探し、検疫分を除く。
+    結果側は evaluate 自身の出力(派生物)も除く"""
     found = sorted(glob.glob(pattern, recursive=True))
     keep = [f for f in found if not quarantined(f)]
     n_q = len(found) - len(keep)
-    print(f"{label} {len(keep)} 件" + (f" (検疫 {n_q} 件を除外)" if n_q else ""))
+    n_d = 0
+    if drop_derived:
+        before = len(keep)
+        keep = [f for f in keep if not derived(f)]
+        n_d = before - len(keep)
+    note = ""
+    if n_q:
+        note += f" (検疫 {n_q} 件を除外)"
+    if n_d:
+        note += f" (評価の出力 {n_d} 件を除外)"
+    print(f"{label} {len(keep)} 件" + note)
     return keep
 
 
 pred_files = find_files(args.pred, "予想ファイル")
-res_files = find_files(args.results, "結果ファイル")
+res_files = find_files(args.results, "結果ファイル", drop_derived=True)
 if not pred_files or not res_files:
     sys.exit("predictions_*.csv または results_*.csv が見つかりません")
 
@@ -161,7 +190,19 @@ def norm_bamei(s):
              .str.strip())
 
 
-res = pd.concat([pd.read_csv(f) for f in res_files], ignore_index=True)
+def read_res(f):
+    """race_code は必ず文字列で読む。
+
+    race_code 列を持たない旧形式(results_summary_*.csv)と連結すると、
+    数値のままでは欠損が入って float64 へ昇格し、astype(str) が
+    '2026090501020501.0' になる。これで新形式の (race_code, umaban) 結合が
+    静かに全滅する(2026/9/8にW36で100%外れた)。16桁は数値として扱わない。"""
+    d = pd.read_csv(f, dtype={"race_code": str})
+    if "race_code" in d.columns:
+        d["race_code"] = d.race_code.astype(str).str.strip()
+    return d
+
+res = pd.concat([read_res(f) for f in res_files], ignore_index=True)
 res["race_date"] = pd.to_datetime(res.race_date).dt.date
 if "bamei" in res.columns:
     res["bamei"] = norm_bamei(res.bamei)
@@ -184,7 +225,7 @@ print(f"結合キー: {KEY} (race_code の無い古い予想ファイルは {FAL
 sel_all = {f: [] for f in FRACS}
 allp = []
 for pf in pred_files:
-    p = pd.read_csv(pf)
+    p = pd.read_csv(pf, dtype={"race_code": str})   # 16桁を数値にしない(上の read_res 参照)
     p["race_date"] = pd.to_datetime(p.race_date).dt.date
     p["batch"] = pf
     if "bamei" in p.columns:
