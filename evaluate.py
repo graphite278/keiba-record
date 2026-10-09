@@ -24,6 +24,14 @@ predictions_*.csv(生成時に保存した全馬分)と確定成績を突き合�
   腕ごとの成績も出す。ただし1週あたり数点しかないので、
   数字を読むのは点数が数千に達してからである。
 
+2026/10/10 改訂:
+  - --fetch の取得窓の始点を、その週の月曜まで広げる。週ファイルは丸ごと上書きなので、
+    窓が週の途中から始まると窓外の開催日が消える(10/9 に既定の14日窓で W39 の
+    9/21-22 が消えかけた。コミット前に気づいて戻した)
+  - 縮小ガード: 書き換え対象の週ファイルで、既存の開催日の行数が1日でも減るなら
+    どの週も書かずに止め、日付と行数差を表示する。Importer の取込遅れで --fetch を
+    回したときも同じ型で記録が消えるため。意図的に減らすときだけ --force
+
 2026/9/2 改訂:
   - --fetch の出力先を週フォルダへ変更(<YYYY>-W<WW>/results_final.csv、冪等な上書き)。
     従来はcwdへ results_YYYYMMDD.csv を書いていたため置き場所がずれ、
@@ -43,7 +51,8 @@ predictions_*.csv(生成時に保存した全馬分)と確定成績を突き合�
 使い方:
   python evaluate.py
   python evaluate.py --fetch                 # DBから結果を取得してから照合
-  python evaluate.py --fetch --days 7        # 直近7日分を取得
+  python evaluate.py --fetch --days 7        # 直近7日分を取得(始点はその週の月曜まで広がる)
+  python evaluate.py --fetch --force         # 既存の確定成績が減る取得でも書く(縮小ガードを外す)
   python evaluate.py --out summary_20260908.csv   # results_*.csv と衝突する名前にしない
 """
 
@@ -72,12 +81,22 @@ ap.add_argument("--out", nargs="?", const=f"summary_{date.today():%Y%m%d}.csv",
 ap.add_argument("--fetch", action="store_true",
                 help="DBから確定成績を書き出してから照合する")
 ap.add_argument("--days", type=int, default=14,
-                help="--fetch で取得する期間(日)")
+                help="--fetch で取得する期間(日)。始点はその週の月曜まで広げる")
+ap.add_argument("--force", action="store_true",
+                help="--fetch で既存の確定成績の行数が減る場合も書き込む(縮小ガードを外す)")
 ap.add_argument("--pghost", default=os.environ.get("PGHOST", "192.168.10.2"))
 args = ap.parse_args()
 
 
-def write_weekly_results(df):
+def shrink_report(old, new):
+    """既存の週ファイル(old)にある開催日ごとに、新しい取得分(new)で行数が減る日を返す。
+    [(race_date, 既存行数, 新行数)]。新しい取得に無い日は 0 行として数える"""
+    o = old.groupby(old.race_date.astype(str)).size()
+    n = new.groupby(new.race_date.astype(str)).size()
+    return [(d, int(c), int(n.get(d, 0))) for d, c in o.items() if n.get(d, 0) < c]
+
+
+def write_weekly_results(df, force=False):
     """確定成績をレース日のISO週ごとに <YYYY>-W<WW>/results_final.csv へ書く。
 
     以前は results_YYYYMMDD.csv をカレントディレクトリへ1本書いていたため、
@@ -87,9 +106,26 @@ def write_weekly_results(df):
     という問題があった。predictions と同じ週フォルダに、固定名で冪等に
     上書きする方式へ変更。再取得しても同じ場所が更新されるだけでgitが汚れない"""
     wk = pd.to_datetime(df.race_date).dt.isocalendar()
+    groups = [(f"{int(y)}-W{int(w):02d}", g)
+              for (y, w), g in df.groupby([wk.year, wk.week])]
+    # 縮小ガード(2026-10-10): 既存ファイルにある開催日の行数が1日でも減るなら、
+    # どの週も書かずに止める。取得窓の切り方(10/9 に W39 の 9/21-22 が消えかけた)や
+    # Importer の取込遅れで、確定済みの記録を部分データで上書きするのを防ぐ。
+    # 意図的に減らすときだけ --force
+    shrinks = []
+    for d, g in groups:
+        path = os.path.join(d, "results_final.csv")
+        if os.path.exists(path):
+            shrinks += [(path, *s) for s in shrink_report(pd.read_csv(path), g)]
+    if shrinks:
+        lines = [f"  {p}: {day} {o} 頭 → {n} 頭({n - o:+d})" for p, day, o, n in shrinks]
+        msg = "既存の確定成績が減る取得です:\n" + "\n".join(lines)
+        if not force:
+            sys.exit(msg + "\n何も書いていません。取得窓・Importer の取込状況を確認すること。"
+                     "意図的に減らすときだけ --force")
+        print(msg + "\n--force により書き込む")
     written = []
-    for (y, w), g in df.groupby([wk.year, wk.week]):
-        d = f"{int(y)}-W{int(w):02d}"
+    for d, g in groups:
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "results_final.csv")
         g.sort_values(["race_code", "umaban"]).to_csv(path, index=False)
@@ -98,7 +134,7 @@ def write_weekly_results(df):
     print("\n".join(written))
 
 
-def fetch_results(days, host):
+def fetch_results(days, host, force=False):
     """確定成績をDBから取得し、週フォルダへ振り分ける。
 
     data_kubun='7' が確定成績。kakutei_chakujun や tansho_odds は
@@ -106,6 +142,9 @@ def fetch_results(days, host):
     """
     end = date.today()
     start = end - timedelta(days=days)
+    # 始点をその週の月曜に揃える(2026-10-10)。週ファイルは丸ごと上書きなので、
+    # 窓が週の途中から始まると窓外の開催日が消える(10/9 に W39 の 9/21-22 で踏みかけた)
+    start -= timedelta(days=start.weekday())
     tmp = "results_fetch_tmp.csv"
     sql = (
         "\\copy (SELECT (kaisai_nen||kaisai_gappi)::date AS race_date,"
@@ -129,11 +168,11 @@ def fetch_results(days, host):
     os.remove(tmp)
     if df.empty:
         sys.exit("取得0件。data_kubun='7' がまだ入っていない可能性")
-    write_weekly_results(df)
+    write_weekly_results(df, force)
 
 
 if args.fetch:
-    fetch_results(args.days, args.pghost)
+    fetch_results(args.days, args.pghost, args.force)
 
 def quarantined(path):
     """invalid/ 検疫フォルダ配下か。パス要素で判定する(部分一致だと
